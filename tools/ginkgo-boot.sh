@@ -10,7 +10,7 @@ mkdir -p $OUT
 GINKGO_TSFW=${GINKGO_TSFW:-/home/usuario/ios-port-ginkgo/dl/tsfw/novatek_ts_tianma_fw.bin} MIDBASE=0x80000000 MIDSIZE=0xc0000000 python3 -I tools/mkadt.py $OUT/ginkgo.adt --midmem
 # Boot-args. Everything topaz (SM6225) hardware is switched off: touch/keys/battery/charger
 # poke other MMIO, direct MDP scanout programs another display block.
-ARGS="debug=0xc serial=3 cpus=${CPUS:-1} keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 \
+ARGS="debug=0xc serial=3 cpus=${CPUS:-4} keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 \
 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_direct=0 \
 sweettouch=${TOUCH:-2} sweetkeys=${KEYS:-1} sweetbattery=0 sweetchg=0 sweetusb=0 sweethw=0 sweetbl=0 ufsrw=${RW:-0} rootrw=${RW:-0} ${*:-}"
 python3 -I tools/mkpayload.py xnu/out/kernel.development.sweet $OUT/ginkgo.adt $OUT/payload.bin --cmdline "$ARGS"
