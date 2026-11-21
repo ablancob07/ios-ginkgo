@@ -1,0 +1,211 @@
+ginkgo GPU: TopazAdreno for the SM6125 Adreno 610 (default alpha PLL, no GX clamp/cxo, firmware from /chosen, zap region 0x57515000, 512 MB GPU pool at 0x80000000)
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -21,6 +21,7 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ 
+@@ -64,7 +65,7 @@
+ #define SMMU_BASE       0x059A0000ull
+ #define SMMU_SIZE       0x10000
+ #define SMMU_CB0        0x8000
+-#define ZAP_REGION      0x55B15000ull
++#define ZAP_REGION      0x57515000ull          /* ginkgo: DT gpu_region (topaz: 0x55B15000) */
+ #define ZAP_REGION_SIZE 0x2000
+ #define GPU_PAS_ID      13
+ 
+@@ -101,8 +102,30 @@
+ #define FW_DIR              "/usr/share/firmware/topaz/"
+ 
+ static volatile uint8_t *gcc, *gpucc, *gpu, *smmu;
++/* ginkgo: the Adreno firmware of the phone's own /vendor/firmware is handed over in /chosen (tools/mkadt.py, GINKGO_GPUFW) */
++static const uint8_t *fw_zap_mdt, *fw_zap_seg, *fw_sqe;
++static size_t fw_zap_mdt_size, fw_zap_seg_size, fw_sqe_size;
++
++static bool
++gpu_fw_from_dt(void)
++{
++	DTEntry node;
++	const void *p;
++	unsigned int n;
++	if (SecureDTLookupEntry(NULL, "/chosen", &node) != kSuccess) {
++		return false;
++	}
++	if (SecureDTGetProperty(node, "gpu-zap-mdt", &p, &n) != kSuccess) { return false; }
++	fw_zap_mdt = (const uint8_t *)p; fw_zap_mdt_size = n;
++	if (SecureDTGetProperty(node, "gpu-zap-seg", &p, &n) != kSuccess) { return false; }
++	fw_zap_seg = (const uint8_t *)p; fw_zap_seg_size = n;
++	if (SecureDTGetProperty(node, "gpu-sqe", &p, &n) != kSuccess) { return false; }
++	fw_sqe = (const uint8_t *)p; fw_sqe_size = n;
++	IOLog("TopazGPU: firmware from the device tree: zap %zu + %zu, sqe %zu bytes\n", fw_zap_mdt_size, fw_zap_seg_size, fw_sqe_size);
++	return true;
++}
+ static bool ready, failed, smmu_on;
+-static uint32_t wptr, seqno, core_mhz = 300;
++static uint32_t wptr, seqno, core_mhz = 320;
+ static IOLock *hw_lock;
+ 
+ struct kbuf {
+@@ -159,8 +182,8 @@
+  * reserved regions in the stock DT, not given to the kernel): a pool of it is
+  * the GPU's, mapped write-combined (Normal non-cacheable: no cache upkeep).
+  */
+-#define GPU_POOL_BASE       0x90000000ull
+-#define GPU_POOL_SIZE       0x40000000ull       /* 1 GB */
++#define GPU_POOL_BASE       0x80000000ull       /* ginkgo: kernel RAM starts at 0xa0000000 (MIDBASE) */
++#define GPU_POOL_SIZE       0x20000000ull       /* 512 MB */
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
+ #define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)
+@@ -381,7 +404,7 @@
+ #define ZP_OUTCTRL     (1u << 0)
+ #define ZP_LOCK        (1u << 31)
+ 
+-static bool
++__unused static bool
+ zonda_la(uint32_t mhz, uint32_t *l, uint32_t *a)
+ {
+ 	static const uint32_t t[][3] = {
+@@ -398,37 +421,40 @@
+ 	return false;
+ }
+ 
++/*
++ * sm6125: "default" alpha PLL at GPU CC + 0 (clk-alpha-pll.c DEFAULT layout): L 4, ALPHA 8, ALPHA_U 0xc,
++ * USER_CTL 0x10, CONFIG_CTL 0x18, STATUS 0x24. gfx3d = PLL0_OUT_AUX2 / 2, so the VCO runs at 2 * mhz.
++ * VCO 1-2 GHz: vco 0; 500 MHz-1 GHz: vco 2 (USER_CTL bits 21:20).
++ */
+ static bool
+ gpu_pll_start(uint32_t mhz)
+ {
+-	uint32_t l, a;
+-
+-	if (!zonda_la(mhz, &l, &a)) {
+-		IOLog("TopazGPU: gpu_mhz=%u is not a stock OPP (320 465 600 785 820 980 1025 1100 1260)\n", mhz);
++	if (mhz < 300 || mhz > 950) {
++		IOLog("TopazGPU: gpu_mhz=%u out of range (300..950)\n", mhz);
+ 		return false;
+ 	}
+-	rmw(gpucc, ZP_MODE, ZP_OUTCTRL, 0);
+-	wr(gpucc, ZP_OPMODE, 0);
+-	wr(gpucc, ZP_L, l);
+-	wr(gpucc, ZP_ALPHA, a);
+-	wr(gpucc, ZP_CFG, 0x08200800);
+-	wr(gpucc, ZP_CFG_U, 0x05022001);
+-	wr(gpucc, ZP_CFG_U1, 0x00000010);
+-	wr(gpucc, ZP_USER, 0x01000101);
+-	rmw(gpucc, ZP_MODE, ZP_BYPASSNL, 0);
+-	rmw(gpucc, ZP_MODE, 0, ZP_RESET_N);
+-	rmw(gpucc, ZP_MODE, 0, ZP_BYPASSNL);
+-	IODelay(1);
+-	rmw(gpucc, ZP_MODE, 0, ZP_RESET_N);
+-	wr(gpucc, ZP_OPMODE, 1);
+-	if (!poll(gpucc, ZP_MODE, ZP_LOCK, ZP_LOCK, 1000)) {
+-		IOLog("TopazGPU: gpu_cc_pll0: no lock at %u MHz (mode %08x)\n", mhz, rd(gpucc, ZP_MODE));
++	uint64_t vco_khz = 2ull * mhz * 1000;
++	uint32_t l = (uint32_t)(vco_khz / 19200);
++	uint32_t alpha_hi = (uint32_t)(((vco_khz % 19200) * 256) / 19200);     /* alpha is 40 bits: alpha_hi = bits 39:32 */
++	uint32_t vco = vco_khz >= 1000000 ? 0 : 2;
++
++	rmw(gpucc, 0x0, ZP_OUTCTRL, 0);                 /* output off */
++	rmw(gpucc, 0x0, ZP_BYPASSNL | ZP_RESET_N, 0);   /* reset, bypass */
++	wr(gpucc, 0x04, l);
++	wr(gpucc, 0x08, 0);
++	wr(gpucc, 0x0c, alpha_hi);
++	wr(gpucc, 0x18, 0x4001055b);                    /* CONFIG_CTL */
++	rmw(gpucc, 0x10, 0x3u << 20, (vco << 20) | (1u << 24) | (1u << 2));    /* VCO, alpha enable, aux2 output */
++	rmw(gpucc, 0x0, 0, ZP_BYPASSNL);
++	IODelay(5);
++	rmw(gpucc, 0x0, 0, ZP_RESET_N);
++	if (!poll(gpucc, 0x0, ZP_LOCK, ZP_LOCK, 1000)) {
++		IOLog("TopazGPU: gpu_cc_pll0: no lock at %u MHz (mode %08x)\n", mhz, rd(gpucc, 0x0));
+ 		return false;
+ 	}
+-	rmw(gpucc, ZP_USER, 0, 0xF);
+-	rmw(gpucc, ZP_MODE, 0, ZP_OUTCTRL);
++	rmw(gpucc, 0x0, 0, ZP_OUTCTRL);
+ 	IODelay(100);
+-	IOLog("TopazGPU: gpu_cc_pll0 locked at %u MHz (l %u alpha %04x)\n", mhz, l, a);
++	IOLog("TopazGPU: gpu_cc_pll0 locked, gfx3d %u MHz (l %u alpha_hi %02x vco %u)\n", mhz, l, alpha_hi, vco);
+ 	return true;
+ }
+ 
+@@ -481,7 +507,6 @@
+ 	}
+ 	rmw(gpucc, 0x1054, CBCR_EN, 0);
+ 	rmw(gpucc, 0x100c, 0, GDSC_COLLAPSE);
+-	rmw(gpucc, 0x1508, 0, 1);
+ 	poll(gpucc, 0x100c, GDSC_PWR_ON, 0, 1000);
+ 	rmw(gpucc, 0x1098, CBCR_EN, 0);
+ 	rmw(gpucc, 0x106c, 0, GDSC_COLLAPSE);
+@@ -507,28 +532,18 @@
+ 	rmw(gpucc, 0x1098, 0xFF0, 0xFF0);
+ 	branch_on(gpucc, 0x1098, "gpucc_cx_gmu");
+ 	branch_on(gpucc, 0x5000, "gpucc_hlos1_vote_gpu_smmu");
+-	if (!gdsc_on(0x100c, 0x1008, 0x1508, 0x100c)) {
++	if (!gdsc_on(0x100c, 0, 0, 0x100c)) {
+ 		IOLog("TopazGPU: GX GDSC: no PWR_ON\n");
+ 		return false;
+ 	}
+-	/* gfx3d: 300/600 MHz from GPLL0 (/2, /1), other stock OPPs from gpu_cc_pll0 (the GX corner is not voted) */
+-	if (core_mhz != 300 && core_mhz != 600 && gpu_pll_start(core_mhz)) {
+-		if (!rcg_set(0x101c, 1, 1)) {                   /* parent 1 = GPU_CC_PLL0_OUT_MAIN */
+-			return false;
+-		}
+-	} else {
+-		if (core_mhz != 300 && core_mhz != 600) {
+-			core_mhz = 300;
+-		}
+-		if (!rcg_set(0x101c, SRC_GPLL0, core_mhz >= 600 ? 1 : 2)) {
+-			return false;
+-		}
++	/* gfx3d (sm6125): PLL0_OUT_AUX2 (parent 2), /2 of the PLL; the GX corner is not voted */
++	if (!gpu_pll_start(core_mhz) || !rcg_set(0x101c, 2, 2)) {
++		return false;
+ 	}
+ 	rmw(gpucc, 0x1054, 0, (1u << 14) | (1u << 13));
+ 	if (!branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d")) {
+ 		return false;
+ 	}
+-	branch_on(gpucc, 0x1060, "gpucc_gx_cxo");
+ 	return true;
+ }
+ 
+@@ -573,11 +588,15 @@
+ 	struct kbuf meta = {};
+ 	bool ok = false;
+ 
+-	IOLog("TopazGPU: zap: embedded firmware (%zu + %zu bytes)\n", topaz_fw_zap_mdt_size, topaz_fw_zap_b02_size);
+-	mdt = (void *)topaz_fw_zap_mdt;
+-	mdt_size = topaz_fw_zap_mdt_size;
+-	seg = (void *)topaz_fw_zap_b02;
+-	seg_size = topaz_fw_zap_b02_size;
++	if (fw_zap_mdt == NULL && !gpu_fw_from_dt()) {
++		IOLog("TopazGPU: no GPU firmware in the device tree\n");
++		return false;
++	}
++	IOLog("TopazGPU: zap: firmware (%zu + %zu bytes)\n", fw_zap_mdt_size, fw_zap_seg_size);
++	mdt = (void *)fw_zap_mdt;
++	mdt_size = fw_zap_mdt_size;
++	seg = (void *)fw_zap_seg;
++	seg_size = fw_zap_seg_size;
+ 	{
+ 		const uint8_t *m = (const uint8_t *)mdt;
+ 		uint32_t phoff = *(const uint32_t *)(m + 28), phnum = *(const uint16_t *)(m + 44);
+@@ -956,8 +975,8 @@
+ 	void *fw = NULL;
+ 	size_t fw_size = 0;
+ 
+-	fw = (void *)topaz_fw_sqe_fw;
+-	fw_size = topaz_fw_sqe_fw_size;
++	fw = (void *)fw_sqe;
++	fw_size = fw_sqe_size;
+ 	IOLog("TopazGPU: cp: SQE %zu bytes, allocating ring\n", fw_size);
+ 	if ((sqe.md == NULL && (!kbuf_alloc(&sqe, fw_size - 4) || !kbuf_map(&sqe))) ||
+ 	    (ring.md == NULL && (!kbuf_alloc(&ring, RB_BYTES) || !kbuf_map(&ring))) ||

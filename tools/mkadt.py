@@ -50,6 +50,16 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'ginkgo boot manifest').digest()
 _tsfw = os.environ.get('GINKGO_TSFW', '')
 TSFW_PROPS = [('touch-firmware', open(_tsfw, 'rb').read())] if _tsfw and os.path.exists(_tsfw) else []
 
+# ginkgo GPU (Adreno 610): zap shader + SQE microcode of the phone's own /vendor/firmware, handed over
+# in /chosen (proprietary, taken from the phone at build time, never committed).
+_gfw = os.environ.get('GINKGO_GPUFW', '')
+GPUFW_PROPS = []
+if _gfw and os.path.isdir(_gfw):
+    for _prop, _file in (('gpu-zap-mdt', 'a610_zap.mdt'), ('gpu-zap-seg', 'a610_zap.b02'), ('gpu-sqe', 'a630_sqe.fw')):
+        _path = os.path.join(_gfw, _file)
+        if os.path.exists(_path):
+            GPUFW_PROPS.append((_prop, open(_path, 'rb').read()))
+
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
 # the root identity and /product of the real D22AP device tree. That tree is
@@ -92,7 +102,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
-    chosen = node('chosen', TSFW_PROPS + [
+    chosen = node('chosen', TSFW_PROPS + GPUFW_PROPS + [
         ph(),
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),

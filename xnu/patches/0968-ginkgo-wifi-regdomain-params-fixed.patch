@@ -56,7 +56,7 @@
  	g_join_variant++;
  	{
 +		/* variants: 3 = chain masks + regdomain, 1 = chain masks only, 2 = regdomain only, 0 = neither */
-+		static const unsigned order[] = { 3, 1, 2, 0 };
++		static const unsigned order[] = { 2, 0, 2, 0 };   /* (params crash the firmware: never 1 or 3) */
 +		unsigned o = order[g_join_variant % 4];
  		uint32_t forced = 0;
  		(void)PE_parse_boot_argn("wifi_rd", &forced, sizeof(forced));
