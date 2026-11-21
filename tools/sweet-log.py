@@ -11,10 +11,11 @@ the ring follows. Byte n of the console stream is at ring offset n % size.
 import struct, sys
 
 data = open(sys.argv[1], 'rb').read()
+HDR = int(sys.argv[3]) if len(sys.argv) > 3 else 4096   # header block size (ginkgo eMMC: 512)
 magic, version, size, total, seq = struct.unpack_from('<8sIIQQ', data, 0)
 if magic != b'SWEETLOG':
     sys.exit('no SWEETLOG header (log never flushed, or wrong area)')
-ring = data[4096:4096 + size]
+ring = data[HDR:HDR + size]
 if total <= size:
     text = ring[:total]
 else:
