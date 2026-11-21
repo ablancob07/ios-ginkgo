@@ -1,0 +1,98 @@
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4621,6 +4621,11 @@
+  * native wifi (802.11 header without QoS + LLC/SNAP).
+  */
+ #define CMD_PDEV_SET_REGDOMAIN  0x4001
++#define CMD_PDEV_SET_PARAM      0x4003
++#define TAG_PDEV_SET_PARAM      0x52
++#define PDEV_PARAM_TX_CHAIN_MASK 1
++#define PDEV_PARAM_RX_CHAIN_MASK 2
++#define PDEV_PARAM_PMF_QOS      34
+ #define TAG_PDEV_SET_REGDOMAIN  0x51
+ #define CMD_VDEV_START          0x5003
+ #define CMD_VDEV_UP             0x5005
+@@ -4695,7 +4700,7 @@
+  * Boot-arg wifi_rd=N forces one code.
+  */
+ static unsigned g_join_variant;
+-static const uint32_t g_rd_cand[] = { 0x6c, 0x60, 0x37, 0x10, 0x64, 0x69 };
++static const uint32_t g_rd_cand[] = { 0x6c };
+ static uint32_t g_rd_used;
+ static const unsigned g_variants[] = { 0 };   /* the vdev start shape is not what is rejected (ginkgo tests 0966) */
+ 
+@@ -4832,16 +4837,26 @@
+ static bool
+ w_set_regdomain(uint32_t rd)
+ {
+-	uint8_t m[4 + 20] = {}, *p = wmi_put_tlv(m, TAG_PDEV_SET_REGDOMAIN, 20);
++	uint8_t m[4 + 24] = {}, *p = wmi_put_tlv(m, TAG_PDEV_SET_REGDOMAIN, 24);
++	p = w_p32(p, 0);                            /* pdev_id */
+ 	p = w_p32(p, rd);                           /* regd */
+ 	p = w_p32(p, rd);                           /* regd_2ghz */
+ 	p = w_p32(p, rd);                           /* regd_5ghz */
+-	p = w_p32(p, 0);                            /* conformance_test_limit_2ghz */
+-	w_p32(p, 0);                                /* conformance_test_limit_5ghz */
++	p = w_p32(p, 0xff);                         /* conformance_test_limit_2ghz: NO_CTL (world) */
++	w_p32(p, 0xff);                             /* conformance_test_limit_5ghz */
+ 	return wmi_send(CMD_PDEV_SET_REGDOMAIN, m, sizeof(m));
+ }
+ 
+ static bool
++w_pdev_param(uint32_t param, uint32_t value)
++{
++	uint8_t m[4 + 8] = {}, *p = wmi_put_tlv(m, TAG_PDEV_SET_PARAM, 8);
++	p = w_p32(p, param);
++	w_p32(p, value);
++	return wmi_send(CMD_PDEV_SET_PARAM, m, sizeof(m));
++}
++
++static bool
+ w_vdev_simple(uint32_t cmd, uint16_t tag)
+ {
+ 	uint8_t m[8], *p = wmi_put_tlv(m, tag, 4);
+@@ -5279,11 +5294,23 @@
+ 	w_ps_off();
+ 	g_join_variant++;
+ 	{
++		/* variants: 3 = chain masks + regdomain, 1 = chain masks only, 2 = regdomain only, 0 = neither */
++		static const unsigned order[] = { 3, 1, 2, 0 };
++		unsigned o = order[g_join_variant % 4];
+ 		uint32_t forced = 0;
+ 		(void)PE_parse_boot_argn("wifi_rd", &forced, sizeof(forced));
+-		g_rd_used = forced != 0 ? forced : g_rd_cand[g_join_variant % (sizeof(g_rd_cand) / sizeof(g_rd_cand[0]))];
+-		bool ok = w_set_regdomain(g_rd_used);
+-		LOG("t=%u ms: join: REGDOMAIN %#x sent %s", g_ms, g_rd_used, ok ? "ok" : "FAILED");
++		g_rd_used = forced != 0 ? forced : g_rd_cand[0];
++		if (o & 1) {
++			bool a = w_pdev_param(PDEV_PARAM_TX_CHAIN_MASK, 1);
++			bool b = w_pdev_param(PDEV_PARAM_RX_CHAIN_MASK, 1);
++			bool c = w_pdev_param(PDEV_PARAM_PMF_QOS, 1);
++			LOG("t=%u ms: join: pdev params tx/rx chain mask 1, pmf_qos 1 sent %s", g_ms, (a && b && c) ? "ok" : "FAILED");
++		}
++		if (o & 2) {
++			bool ok = w_set_regdomain(g_rd_used);
++			LOG("t=%u ms: join: REGDOMAIN %#x (+ctl 0xff) sent %s", g_ms, g_rd_used, ok ? "ok" : "FAILED");
++		}
++		LOG("t=%u ms: join: ATTEMPT %u: params %u regdomain %u", g_ms, g_join_variant, o & 1, (o >> 1) & 1);
+ 		IOSleep(100);
+ 	}
+ 	{
+@@ -5362,7 +5389,7 @@
+ w_join_event(uint32_t id, const uint8_t *t, uint32_t len)
+ {
+ 	uint16_t l = 0;
+-	uint32_t v[4] = {};
++	uint32_t v[12] = {};
+ 	if (len >= 4) {
+ 		memcpy(&l, t, 2);
+ 	}
+@@ -5376,6 +5403,8 @@
+ 		/* ginkgo: 1 invalid vdev, 2 not supported, 3 DFS violation, 4 invalid regdomain */
+ 		LOG("t=%u ms: join: VDEV_START_RESP vdev %u req %u type %u status %d (tlv len %u)", g_ms, v[0], v[1], v[2],
+ 		    (int32_t)v[3], (unsigned)l);
++		LOG("t=%u ms: join: VDEV_START_RESP words %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", g_ms, v[0], v[1], v[2],
++		    v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
+ 	} else if (id == 0x6001 && s_state == S_UP) {   /* PEER_STA_KICKOUT */
+ 		LOG("t=%u ms: join: peer kickout", g_ms);
+ 		w_teardown();
