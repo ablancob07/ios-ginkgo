@@ -12,10 +12,10 @@ index c2864ab..e2d4267 100644
  bsd/dev/topaz_fw.c			standard
 diff --git a/bsd/dev/ginkgo_touch.c b/bsd/dev/ginkgo_touch.c
 new file mode 100644
-index 0000000..6d3a8c7
+index 0000000..e7a91b0
 --- /dev/null
 +++ b/bsd/dev/ginkgo_touch.c
-@@ -0,0 +1,561 @@
+@@ -0,0 +1,600 @@
 +/*
 + * ginkgo (Redmi Note 8, SM6125): Novatek NT36672A touch controller on QUPv3 wrapper 0 SE2
 + * (spi@4a88000), reset GPIO87, SPI pins GPIO6-9 (function qup02), all in the TLMM WEST tile.
@@ -440,14 +440,15 @@ index 0000000..6d3a8c7
 +}
 +
 +/* Parse one 66-byte read (p[0] is the dummy byte). Returns 0 or an errno. */
-+static void
++static bool
 +gt_parse(const uint8_t *p)
 +{
 +	int x[10] = {0}, y[10] = {0};
 +	uint32_t mask = 0;
 +
-+	if (p[1] == 0xfd || p[1] == 0xfe || p[1] == 0x77) {
-+		return;                                 /* IC in recovery/reset: keep state */
++	if (p[1] == 0xfd || p[1] == 0xfe ||
++	    (p[1] == 0x77 && p[2] == 0x77 && p[3] == 0x77 && p[4] == 0x77 && p[5] == 0x77 && p[6] == 0x77)) {
++		return true;                            /* IC asks for recovery (vendor ESD pattern) */
 +	}
 +	for (unsigned i = 0; i < 10; i++) {
 +		const uint8_t *f = p + 6 * i + 1;
@@ -465,6 +466,48 @@ index 0000000..6d3a8c7
 +		y[id - 1] = (int)py;
 +	}
 +	gt_report(mask, x, y);
++	return false;
++}
++
++/*
++ * Bring the IC up from a reset: pulse GPIO87, identify it, download the firmware, wait for the
++ * firmware's reset-complete state (0xA0..0xAF). The NT36672A is a TDDI: when the panel is put to
++ * sleep and woken, or on an ESD event, the touch part resets and loses its firmware, so this runs
++ * again whenever the IC stops reporting a live state.
++ */
++static bool
++gt_ic_start(const unsigned char *fw, unsigned fwlen)
++{
++	uint8_t id[8] = { 0 };
++	bool ok = false;
++
++	gt_pin_out(GT_PIN_RESET, 0);
++	gt_sleep_ms(20);
++	gt_pin_out(GT_PIN_RESET, 1);
++	gt_sleep_ms(150);
++	for (int i = 0; i < 5 && !ok; i++) {
++		(void)nvt_write1(0x3f0fe, 0x69);
++		gt_sleep_ms(35);
++		(void)nvt_write1(0x3f310, 0);
++		gt_sleep_ms(10);
++		ok = nvt_read(0x1f64e, id, 7) == 0 && id[1] == 0x0a && id[4] == 0x72 && id[5] == 0x66 && id[6] == 0x03;
++	}
++	printf("SWEET NVT: chip id %02x %02x %02x %02x %02x %02x -> %s\n", id[1], id[2], id[3], id[4], id[5], id[6],
++	    ok ? "NT36672A" : "unexpected");
++	if (!ok || !fw) {
++		return false;
++	}
++	int e = gt_download_fw(fw, fwlen);
++	uint8_t rs[6] = { 0 };
++	int tries = 0;
++	for (; tries < 50; tries++) {
++		if (nvt_read(GT_EVT | 0x60, rs, 6) == 0 && rs[1] >= 0xa0 && rs[1] <= 0xaf) {
++			break;
++		}
++		gt_sleep_ms(10);
++	}
++	printf("SWEET NVT: firmware download err=%d, state %#x after %d tries\n", e, rs[1], tries);
++	return e == 0 && tries < 50;
 +}
 +
 +static void
@@ -510,48 +553,44 @@ index 0000000..6d3a8c7
 +	}
 +	gt_pin_cfg(GT_PIN_IRQ, 0, 0, 3, 0);
 +	gt_se_init();
-+	gt_pin_out(GT_PIN_RESET, 0);
-+	gt_sleep_ms(20);
-+	gt_pin_out(GT_PIN_RESET, 1);
-+	gt_sleep_ms(150);
-+
-+	uint8_t id[8] = { 0 };
-+	bool ok = false;
-+	for (int i = 0; i < 5 && !ok; i++) {
-+		(void)nvt_write1(0x3f0fe, 0x69);
-+		gt_sleep_ms(35);
-+		(void)nvt_write1(0x3f310, 0);
-+		gt_sleep_ms(10);
-+		ok = nvt_read(0x1f64e, id, 7) == 0 && id[1] == 0x0a && id[4] == 0x72 && id[5] == 0x66 && id[6] == 0x03;
-+	}
-+	printf("SWEET NVT: chip id %02x %02x %02x %02x %02x %02x -> %s\n", id[1], id[2], id[3], id[4], id[5], id[6],
-+	    ok ? "NT36672A" : "unexpected");
-+	if (!ok || !fw) {
-+		goto out;
-+	}
-+	int e = gt_download_fw(fw, fwlen);
-+	uint8_t rs[6] = { 0 };
-+	int tries = 0;
-+	for (; tries < 50; tries++) {
-+		if (nvt_read(GT_EVT | 0x60, rs, 6) == 0 && rs[1] >= 0xa0 && rs[1] <= 0xaf) {
-+			break;
-+		}
-+		gt_sleep_ms(10);
-+	}
-+	printf("SWEET NVT: firmware download err=%d, state %#x after %d tries\n", e, rs[1], tries);
-+	if (e || tries >= 50) {
++	if (!fw || !gt_ic_start(fw, fwlen)) {
 +		goto out;
 +	}
 +	printf("SWEET NVT: touch running (event buffer %#x, polling)\n", GT_EVT);
-+	unsigned errs = 0;
++	unsigned errs = 0, bad = 0, ticks = 0, recoveries = 0;
++	uint64_t frames = 0;
 +	for (;;) {
 +		uint8_t p[67];
++		bool recover = false;
 +		if (nvt_read(GT_EVT, p, 66) == 0) {
 +			errs = 0;
-+			gt_parse(p);
++			frames++;
++			recover = gt_parse(p);
 +		} else if (++errs == 20) {
 +			gt_report(0, gt.x, gt.y);
 +			printf("SWEET NVT: persistent SPI errors, backing off\n");
++		}
++		/* liveness: the firmware keeps its state byte in 0xa0..0xaf; after a TDDI reset it is gone */
++		if ((++ticks % 50u) == 0 && errs == 0) {
++			uint8_t rs[6] = { 0 };
++			if (nvt_read(GT_EVT | 0x60, rs, 6) == 0 && rs[1] >= 0xa0 && rs[1] <= 0xaf) {
++				bad = 0;
++			} else {
++				bad++;
++			}
++			if ((ticks % 6000u) == 0) {
++				printf("SWEET NVT: alive state=%#x frames=%llu recoveries=%u\n", rs[1], frames, recoveries);
++			}
++		}
++		if (recover || bad >= 3) {
++			printf("SWEET NVT: IC lost its firmware (%s), reloading\n", recover ? "recovery marker" : "no live state");
++			gt_report(0, gt.x, gt.y);
++			bool up = gt_ic_start(fw, fwlen);
++			recoveries++;
++			bad = 0;
++			if (!up) {
++				gt_sleep_ms(2000);
++			}
 +		}
 +		gt_sleep_ms(errs >= 20 ? 500 : 8);
 +	}
