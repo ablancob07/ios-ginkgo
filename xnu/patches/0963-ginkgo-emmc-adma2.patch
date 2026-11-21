@@ -1,0 +1,150 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -348,9 +348,9 @@
+ 	return error;
+ }
+ 
+-/* Read or write count 512-byte sectors at lba through the bounce buffer. */
++/* Read or write count 512-byte sectors at lba through the bounce buffer (polled PIO). */
+ static int
+-em_xfer_blocks(uint64_t lba, uint32_t count, bool write)
++em_xfer_pio(uint64_t lba, uint32_t count, bool write)
+ {
+ 	uint32_t *buf = (uint32_t *)(su.dma + DMA_BOUNCE);
+ 	uint32_t xfer = (1u << 1) | (write ? 0u : (1u << 4));
+@@ -412,6 +412,120 @@
+ 	return error;
+ }
+ 
++
++/*
++ * ADMA2 (64-bit addressing, 12-byte descriptors: SDHCI 3.0). The host is not cache coherent, so
++ * the bounce buffer is cleaned/flushed around each transfer, exactly as the UFS driver did.
++ * Boot-arg emmcdma=0 selects the polled PIO path above.
++ */
++#define EM_ADMA_ADDR    0x58
++#define EM_INT_ADMAERR  (1u << 25)
++#define EM_ADMA_CHUNK   32768u
++
++struct em_adma {
++	uint16_t attr;          /* bit0 valid, bit1 end, bits5:4 act (2 = transfer) */
++	uint16_t len;
++	uint32_t addr_lo;
++	uint32_t addr_hi;
++} __attribute__((packed));
++
++static bool em_dma;
++static uint64_t em_stat_bytes, em_stat_ns;
++static uint32_t em_stat_reqs;
++
++static int
++em_xfer_dma(uint64_t lba, uint32_t count, bool write)
++{
++	struct em_adma *tbl = (struct em_adma *)(su.dma + DMA_UTRL);
++	uint64_t tbl_pa = su.dma_pa + DMA_UTRL, buf_pa = su.dma_pa + DMA_BOUNCE;
++	uint32_t bytes = count * 512u, n = 0, idx, xfer, rr[4], s = 0;
++	int error;
++
++	for (uint32_t off = 0; off < bytes; off += EM_ADMA_CHUNK, n++) {
++		uint32_t len = MIN(EM_ADMA_CHUNK, bytes - off);
++		uint64_t pa = buf_pa + off;
++		tbl[n].attr = (uint16_t)(0x21u | ((off + len >= bytes) ? 0x02u : 0u));
++		tbl[n].len = (uint16_t)len;
++		tbl[n].addr_lo = (uint32_t)pa;
++		tbl[n].addr_hi = (uint32_t)(pa >> 32);
++	}
++	dma_clean(DMA_UTRL, n * (uint32_t)sizeof(struct em_adma));
++	if (write) {
++		dma_clean(DMA_BOUNCE, bytes);
++	} else {
++		dma_sync(DMA_BOUNCE, bytes);
++	}
++	__builtin_arm_dsb(0xf);
++	em_wr32(EM_ADMA_ADDR, (uint32_t)tbl_pa);
++	em_wr32(EM_ADMA_ADDR + 4, (uint32_t)(tbl_pa >> 32));
++
++	xfer = 1u | (1u << 1) | (write ? 0u : (1u << 4));      /* DMA enable, block count enable */
++	idx = write ? 24 : 17;
++	if (count > 1) {
++		xfer |= (1u << 5) | (1u << 2);                  /* multi block, auto CMD12 */
++		idx = write ? 25 : 18;
++	}
++	error = em_cmd(idx, (uint32_t)lba, EM_F_R1 | EM_F_DATA, xfer, count, rr);
++	if (error) {
++		return error;
++	}
++	uint64_t dl = em_deadline(3000 * NSEC_PER_MSEC);
++	while (!((s = em_rd32(EM_INT)) & (EM_INT_XFER | EM_INT_ERR))) {
++		if (em_expired(dl)) {
++			error = ETIMEDOUT;
++			goto fail;
++		}
++	}
++	if (s & EM_INT_ERR) {
++		error = EIO;
++		goto fail;
++	}
++	em_wr32(EM_INT, EM_INT_XFER);
++	if (!write) {
++		dma_sync(DMA_BOUNCE, bytes);
++	}
++	return 0;
++
++fail:
++	printf("SWEET EMMC: DMA %s lba 0x%llx x%u failed: %d int 0x%x\n", write ? "write" : "read",
++	    lba, count, error, s);
++	em_wr32(EM_INT, 0xffffffff);
++	em_reset_lines();
++	(void)em_cmd(12, 0, EM_F_R1B, 0, 0, rr);
++	return error;
++}
++
++/* One transfer with throughput statistics; DMA falls back to PIO for good if it ever fails. */
++static int
++em_xfer_blocks(uint64_t lba, uint32_t count, bool write)
++{
++	uint64_t t0 = mach_absolute_time(), ns;
++	int error;
++
++	if (em_dma) {
++		error = em_xfer_dma(lba, count, write);
++		if (error) {
++			printf("SWEET EMMC: DMA failed (%d), falling back to PIO\n", error);
++			em_dma = false;
++			error = em_xfer_pio(lba, count, write);
++		}
++	} else {
++		error = em_xfer_pio(lba, count, write);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	em_stat_bytes += (uint64_t)count * 512u;
++	em_stat_ns += ns;
++	em_stat_reqs++;
++	if (em_stat_bytes >= (64ull << 20)) {
++		printf("SWEET EMMC: %s %llu MiB in %llu ms = %llu KB/s over %u requests\n", em_dma ? "dma" : "pio",
++		    em_stat_bytes >> 20, em_stat_ns / NSEC_PER_MSEC,
++		    (em_stat_bytes >> 10) * 1000000000ull / (em_stat_ns ? em_stat_ns : 1), em_stat_reqs);
++		em_stat_bytes = em_stat_ns = 0;
++		em_stat_reqs = 0;
++	}
++	return error;
++}
++
+ /* Bring the host up and the card to transfer state, 8-bit, high speed. */
+ static int
+ em_bringup(void)
+@@ -475,7 +589,13 @@
+ 	if ((error = em_cmd(13, 1u << 16, EM_F_R1, 0, 0, rr)) != 0) {
+ 		return error;
+ 	}
+-	printf("SWEET EMMC: card ready, 8-bit high speed, status 0x%x\n", rr[0]);
++	uint32_t dmaarg = 1;
++	(void)PE_parse_boot_argn("emmcdma", &dmaarg, sizeof(dmaarg));
++	em_dma = dmaarg != 0 && (caps & (1u << 19)) && (caps & (1u << 28));    /* ADMA2 + 64-bit */
++	if (em_dma) {
++		em_wr8(EM_HOSTCTL, (uint8_t)(em_rd8(EM_HOSTCTL) | 0x18));       /* ADMA2, 64-bit descriptors */
++	}
++	printf("SWEET EMMC: card ready, 8-bit high speed, status 0x%x, %s\n", rr[0], em_dma ? "ADMA2" : "PIO");
+ 	return 0;
+ }
+ 
