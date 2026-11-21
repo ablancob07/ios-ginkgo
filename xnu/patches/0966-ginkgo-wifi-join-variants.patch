@@ -1,0 +1,80 @@
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4678,14 +4678,27 @@
+ static uint8_t *w_p32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); return p + 4; }
+ static uint8_t *w_pmac(uint8_t *p, const uint8_t *mac) { bzero(p, 8); memcpy(p, mac, 6); return p + 8; }
+ 
++/*
++ * ginkgo: the WCN3990 firmware answers VDEV_START with status -1 (and a 40-byte response, a newer
++ * WMI than topaz's). Each join tries the next variant and logs it, to find what this firmware wants:
++ * bit 0: HT phymode (11NG_HT20 = 5 / 11NA_HT20 = 4) + WMI_CHAN_FLAG_ALLOW_HT (bit 11)
++ * bit 1: VDEV_DOWN + VDEV_STOP before the start
++ * bit 2: extended start command (preferred rx/tx streams 1)
++ */
++static unsigned g_join_variant;
++static const unsigned g_variants[] = { 0, 1, 2, 4, 7, 5 };
++
+ static uint8_t *
+ w_channel(uint8_t *p, uint32_t freq)
+ {
++	unsigned v = g_variants[g_join_variant % (sizeof(g_variants) / sizeof(g_variants[0]))];
++	uint32_t mode = (v & 1) ? (freq < 4000 ? 5u : 4u) : (freq < 4000 ? 1u : 0u);
++	uint32_t flags = (v & 1) ? (1u << 11) : 0;
+ 	uint8_t *c = wmi_put_tlv(p, TAG_CHANNEL, 24);
+ 	c = w_p32(c, freq);
+ 	c = w_p32(c, freq);
+ 	c = w_p32(c, 0);
+-	c = w_p32(c, freq < 4000 ? 1 : 0);
++	c = w_p32(c, mode | flags);
+ 	c = w_p32(c, (40u << 8) | (40u << 16));
+ 	return w_p32(c, 40u << 8);
+ }
+@@ -4784,17 +4797,25 @@
+ static bool
+ w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim)
+ {
+-	uint8_t m[4 + 72 + 4 + 24 + 4] = {}, *p;
+-	p = wmi_put_tlv(m, TAG_VDEV_START, 72);
++	unsigned v = g_variants[g_join_variant % (sizeof(g_variants) / sizeof(g_variants[0]))];
++	uint32_t fixed = (v & 4) ? 88 : 72;
++	uint8_t m[4 + 88 + 4 + 24 + 4] = {}, *p;
++	p = wmi_put_tlv(m, TAG_VDEV_START, fixed);
+ 	p = w_p32(p, 0);
+ 	p = w_p32(p, 0);
+ 	p = w_p32(p, bcn);
+ 	p = w_p32(p, dtim);
+ 	p = w_p32(p, 0);
+ 	p += 36 + 16;                               /* ssid (empty for a station), tx rate/power, noa, hw ack */
++	if (v & 4) {
++		p = w_p32(p, 1);                    /* preferred_rx_streams */
++		p = w_p32(p, 1);                    /* preferred_tx_streams */
++		p = w_p32(p, 0);                    /* cac_duration_ms */
++		p = w_p32(p, 0);                    /* regdomain */
++	}
+ 	p = w_channel(p, freq);
+-	wmi_put_tlv(p, TAG_ARRAY_STRUCT, 0);
+-	return wmi_send(CMD_VDEV_START, m, sizeof(m));
++	p = wmi_put_tlv(p, TAG_ARRAY_STRUCT, 0);
++	return wmi_send(CMD_VDEV_START, m, (uint32_t)(p - m));
+ }
+ 
+ static bool
+@@ -5233,7 +5254,17 @@
+ 	LOG("t=%u ms: join: %.*s %02x:%02x:%02x:**:**:** %u MHz %s", g_ms, (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
+ 	    s_bssid[2], s_freq, s_rsn ? "WPA2" : "open");
+ 	w_ps_off();
+-	LOG("t=%u ms: join: vdev start %u MHz mode %u bcn %u dtim %u", g_ms, s_freq, s_freq < 4000 ? 1u : 0u, bcn, dtim);
++	g_join_variant++;
++	{
++		unsigned v = g_variants[g_join_variant % (sizeof(g_variants) / sizeof(g_variants[0]))];
++		if (v & 2) {
++			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++			w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++			IOSleep(50);
++		}
++		LOG("t=%u ms: join: VARIANT %u (ht %u, stop-first %u, extended %u): vdev start %u MHz bcn %u dtim %u", g_ms, v,
++		    v & 1, (v >> 1) & 1, (v >> 2) & 1, s_freq, bcn, dtim);
++	}
+ 	if (!w_vdev_start(s_freq, bcn, dtim)) {
+ 		LOG("t=%u ms: join: vdev start command not sent", g_ms);
+ 		w_join_end(EIO);
