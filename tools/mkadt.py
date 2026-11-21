@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build the minimal Apple Device Tree that the TOPAZ xnu needs to boot.
+"""Build the minimal Apple Device Tree that the GINKGO xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the topaz (Redmi Note 12 4G, SM6225 khaje) live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the ginkgo (Redmi Note 8, SM6125 trinket) live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
 """
 import hashlib, os, struct, sys
 
@@ -31,17 +31,18 @@ GICD, GICD_SIZE = 0x0f200000, 0x10000
 GICR, GICR_SIZE = 0x0f300000, 0x100000
 # cont_splash_region left lit by ABL
 FB, FB_SIZE = 0x5c000000, 0xf00000
-SWEET_ECID = 0x544f50415a000001  # 'TOPAZ' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
-# Internal UFS host (ufshc@4804000 "ufs_mem"); QEMU virt has none
-UFS, UFS_SIZE = 0x04804000, 0x3000
+SWEET_ECID = 0x47494e4b474f0001  # 'GINKGO' + 1, synthetic
+FB_W, FB_H, FB_STRIDE = 1080, 2340, 1080 * 4   # ginkgo: NT36672A Tianma 1080x2340
+# ginkgo: internal eMMC host (sdhci@4744000, sdhci-msm v5); the node keeps the name
+# sweet-ufs because bsd/dev/sweet_ufs.c looks it up (patch 0960 swaps the driver).
+UFS, UFS_SIZE = 0x04744000, 0x4000
 TIMEBASE = 19200000
 VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
-BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
+BOOT_MANIFEST_HASH = hashlib.sha384(b'ginkgo boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -149,7 +150,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             ('l3-cache-id', u32(0)),
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2803200000)),
+            ('clock-frequency', u32(2016000000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -196,7 +197,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             # which must match the canvas: sweetfb_native=1 with a 1125x2436 canvas makes
             # backboardd ask for a hardware scaler that does not exist)
             ('canvas-width', u32(1080 if native else 1125)),
-            ('canvas-height', u32(2400 if native else 2436)),
+            ('canvas-height', u32(2340 if native else 2436)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -210,7 +211,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
         ph(),
-        ('compatible', cstr('qcom,ufshc')),
+        ('compatible', cstr('qcom,sdhci-msm-v5')),
         ('reg', u64(UFS, UFS_SIZE)),
     ])
 
@@ -243,7 +244,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,ginkgo') + cstr('xiaomi,sweet') + cstr('qcom,trinket') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
