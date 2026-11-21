@@ -15,10 +15,10 @@ cd "$(dirname "$0")"
 CC="clang --target=aarch64-none-elf"
 LD=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-jump-tables -Wall -Wextra -Wno-unused-command-line-argument"
+CFLAGS="${EXTRA_CFLAGS:-} -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-jump-tables -Wall -Wextra -Wno-unused-command-line-argument"
 DTBDIR=${DTBDIR:-../../../dtb/stock}
 MKBOOTIMG=${MKBOOTIMG:-python3 /home/usuario/ios-port-ginkgo/dl/mkbootimg/src/mkbootimg.py}
-SRCS="start.S shim.c console.c mmu.c fdt.c loader.c emmc.c"
+SRCS="start.S shim.c console.c mmu.c fdt.c loader.c emmc.c touch.c"
 mkdir -p out
 OBJS=""
 for f in $SRCS; do

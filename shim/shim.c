@@ -11,6 +11,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "emmc.h"
+#include "touch.h"
 
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -292,10 +293,17 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		/* ginkgo: no payload -> probe the internal eMMC (read only), keep the
 		 * result on screen for ~3 min, then reset back to the bootloader. */
 		con_skip();
+#ifdef PROBE_TOUCH
+		stage = "touch";
+		test_touch();
+		con_skip();
+		con_str("TOUCH", "probe done, reset in ~3 min");
+#else
 		stage = "emmc";
 		test_emmc();
 		con_skip();
 		con_str("EMMC", "probe done, reset in ~3 min");
+#endif
 		delay_ms(180000);
 		reset(20);
 	}
