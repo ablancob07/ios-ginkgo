@@ -1,0 +1,18 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -409,7 +409,14 @@
+ 		    r[0x000 / 4], r[0x004 / 4], r[0x008 / 4], r[0x00c / 4], r[0x03c / 4], r[0x040 / 4],
+ 		    r[0x01c / 4], r[0x024 / 4], r[0x090 / 4], r[0x084 / 4]);
+ 	}
+-	if (fVig0 != NULL && fCtl0 != NULL) {
++	/*
++	 * ginkgo: the MDP shadow-buffer/flip path reprograms the display pipe (VIG0 source, CTL flush).
++	 * Opt in with sweetmdp=1; by default the console keeps drawing into the ABL panel memory that
++	 * the MDP is already scanning, which cannot go wrong.
++	 */
++	uint32_t ginkgoMdp = 0;
++	(void)PE_parse_boot_argn("sweetmdp", &ginkgoMdp, sizeof(ginkgoMdp));
++	if (ginkgoMdp && fVig0 != NULL && fCtl0 != NULL) {
+ 		fBootSrc = fVig0[0x14 / 4];
+ 		fBootStride = fVig0[0x24 / 4];
+ 		fScanPhys = fBootSrc;
