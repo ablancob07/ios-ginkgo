@@ -10,7 +10,7 @@
 #include "console.h"
 #include "mmu.h"
 #include "loader.h"
-#include "ufs.h"
+#include "emmc.h"
 
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -289,6 +289,15 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		delay_ms(1000);
 		con_skip();
 		con_str("LOADER", loader_boot(dtb));
+		/* ginkgo: no payload -> probe the internal eMMC (read only), keep the
+		 * result on screen for ~3 min, then reset back to the bootloader. */
+		con_skip();
+		stage = "emmc";
+		test_emmc();
+		con_skip();
+		con_str("EMMC", "probe done, reset in ~3 min");
+		delay_ms(180000);
+		reset(20);
 	}
 	for (;;)
 		__asm__ volatile("wfe");
@@ -532,12 +541,12 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
-	stage = "ufs";
-	test_ufs();
+	/* No payload: probe the internal eMMC while the MMU is still off. */
+	stage = "emmc";
+	test_emmc();
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
-	con_str("UFS", "probe done, reset in ~3 min");
+	con_str("EMMC", "probe done, reset in ~3 min");
 	delay_ms(180000);
 	reset(20);
 
