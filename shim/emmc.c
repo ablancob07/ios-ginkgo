@@ -284,12 +284,23 @@ static void phase2(uint32_t lba)
 		con_hex("EXTCSD", st);
 	}
 
-	/* C: 8-bit bus (card first, then host) */
-	st = switch_ext(183, 1);
-	if (!st)
-		wr8(R_HOSTCTL, rd8(R_HOSTCTL) | 0x20);
-	uint32_t e8 = st ? st : hash_blocks(lba, n, &h1, &us);
-	con_hex2("EMMC 8BIT", "err=", e8, "match=", e8 ? 0 : (h1 == h0));
+	/* C: wider bus (card first, then host). EXT_CSD BUS_WIDTH: 0 = 1-bit, 1 = 4-bit, 2 = 8-bit. */
+	uint32_t e8 = 1;
+	for (int k = 0; k < 2 && e8; k++) {
+		uint8_t hc = rd8(R_HOSTCTL) & ~0x22;	/* clear 4-bit and 8-bit flags */
+
+		st = switch_ext(183, k ? 1 : 2);
+		if (!st)
+			wr8(R_HOSTCTL, hc | (k ? 0x02 : 0x20));
+		e8 = st ? st : hash_blocks(lba, n, &h1, &us);
+		if (!e8 && h1 != h0)
+			e8 = 0x80000000;
+		con_hex2(k ? "EMMC 4BIT" : "EMMC 8BIT", "err=", e8, "hostctl=", rd8(R_HOSTCTL));
+		if (e8) {
+			switch_ext(183, 0);
+			wr8(R_HOSTCTL, hc);
+		}
+	}
 
 	/* D: high-speed timing, target <= 50 MHz */
 	if (!e8) {
@@ -311,7 +322,7 @@ static void phase2(uint32_t lba)
 		switch_ext(185, 0);
 		wr8(R_HOSTCTL, rd8(R_HOSTCTL) & ~0x04);
 		switch_ext(183, 0);
-		wr8(R_HOSTCTL, rd8(R_HOSTCTL) & ~0x20);
+		wr8(R_HOSTCTL, rd8(R_HOSTCTL) & ~0x22);
 	}
 	sd_cmd(0, 0, F_NONE, 0, 0);
 	con_str("EMMC", "phase 2 done; card back to idle");
