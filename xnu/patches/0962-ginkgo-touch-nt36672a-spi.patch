@@ -1,0 +1,630 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c2864ab..e2d4267 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/topaz_sta.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/ginkgo_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
+diff --git a/bsd/dev/ginkgo_touch.c b/bsd/dev/ginkgo_touch.c
+new file mode 100644
+index 0000000..6d3a8c7
+--- /dev/null
++++ b/bsd/dev/ginkgo_touch.c
+@@ -0,0 +1,561 @@
++/*
++ * ginkgo (Redmi Note 8, SM6125): Novatek NT36672A touch controller on QUPv3 wrapper 0 SE2
++ * (spi@4a88000), reset GPIO87, SPI pins GPIO6-9 (function qup02), all in the TLMM WEST tile.
++ *
++ * Verified on the phone with the shim probe (shim/touch.c):
++ *  - SE2 firmware is SPI (proto 1), 32-bit x 16-word FIFOs, XO clock 19.2 MHz via the
++ *    gcc_qupv3_wrap0_s2 RCG; SPI mode 0, 8-bit words, 4.8 MHz.
++ *  - Every NT36xxx read returns one dummy byte (0xff) before the data.
++ *  - The Tianma panel's IC has no firmware of its own: it must be downloaded into SRAM after
++ *    a reset (novatek_ts_tianma_fw.bin from the phone's /vendor). It is handed over in the
++ *    device tree, /chosen "touch-firmware" (tools/mkadt.py, GINKGO_TSFW), never in the repo.
++ *  - Event buffer 0x21C00, 66-byte report, 6 bytes a finger from byte 1: id = b>>3 (1..10),
++ *    status = b&7 (1/2 touching), x = (p[1]<<4)|(p[3]>>4), y = (p[2]<<4)|(p[3]&15), in panel
++ *    pixels (1080x2340). Unused slots read 0xff.
++ * Polled; one kernel thread owns SE2. Enable with boot-arg sweettouch=2.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void ginkgo_touch_init(void);
++
++#define GT_GCC_PA       0x01400000u
++#define GT_SE2_PA       0x04a88000u
++#define GT_TLMM_WEST_PA 0x00500000u
++#define GT_GCC_VOTE     0x7900cu        /* QUP0 wrapper + SE2 clock votes = 0x13c0 */
++#define GT_GCC_RCG      0x1f3a8u        /* gcc_qupv3_wrap0_s2_clk_src CMD; CFG +4; branch CBCR -4 */
++#define GT_PIN_RESET    87u
++#define GT_PIN_IRQ      88u
++#define GT_EVT          0x21c00u
++
++#define SE_STATUS       0x040u
++#define SE_CLK_CFG      0x048u
++#define SE_CLK_SEL      0x07cu
++#define SE_OUTCTRL      0x024u
++#define SE_CGC          0x028u
++#define SE_FORCEDEF     0x020u
++#define SE_DMA_MODE     0x258u
++#define SE_CPHA         0x224u
++#define SE_CPOL         0x230u
++#define SE_DEMUX_INV    0x24cu
++#define SE_DEMUX_SEL    0x250u
++#define SE_WORD_LEN     0x268u
++#define SE_TXLEN        0x26cu
++#define SE_RXLEN        0x270u
++#define SE_CMD0         0x600u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TXFIFO       0x700u
++#define SE_RXFIFO       0x780u
++#define SE_TXSTAT       0x800u
++#define SE_RXSTAT       0x804u
++#define SE_TXWM         0x80cu
++#define SE_RXWM         0x810u
++#define SE_RXRFR        0x814u
++
++#define IRQ_DONE        (1u << 0)
++#define IRQ_ERR         ((7u << 1) | (3u << 24) | (3u << 28))
++
++static struct {
++	vm_offset_t gcc, se, west;
++	bool started;
++	uint32_t active;
++	int x[10], y[10];
++} gt;
++static int gt_chan;
++
++static inline uint32_t
++gt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++gt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static uint64_t
++gt_deadline(uint64_t ns)
++{
++	uint64_t d;
++	nanoseconds_to_absolutetime(ns, &d);
++	return d + mach_absolute_time();
++}
++
++static void
++gt_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&gt_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++gt_pin_cfg(unsigned pin, unsigned mux, unsigned pull, unsigned drv, unsigned oe)
++{
++	gt_wr(gt.west, 0x1000u * pin, (mux << 2) | pull | (drv << 6) | (oe ? 0x200u : 0u));
++}
++
++static void
++gt_pin_out(unsigned pin, unsigned v)
++{
++	gt_wr(gt.west, 0x1000u * pin + 4u, v ? 2u : 0u);
++}
++
++/* One SPI command: op 1 = TX_ONLY from a[0..na) then b[0..nb); op 2 = RX_ONLY into rx. */
++static int
++gt_spi(unsigned op, const uint8_t *a, unsigned na, const uint8_t *b, unsigned nb,
++    uint8_t *rx, unsigned nrx, bool keep_cs)
++{
++	unsigned n = (op == 1) ? na + nb : nrx, sent = 0, got = 0;
++	uint64_t dl = gt_deadline(20 * NSEC_PER_MSEC);
++
++	if (n == 0 || n > 0xffffffu) {
++		return EINVAL;
++	}
++	while (gt_rd(gt.se, SE_STATUS) & 1u) {
++		if (mach_absolute_time() > dl) {
++			return EBUSY;
++		}
++	}
++	gt_wr(gt.se, SE_IRQ_CLR, 0xffffffffu);
++	gt_wr(gt.se, op == 1 ? SE_TXLEN : SE_RXLEN, n);
++	gt_wr(gt.se, SE_CMD0, (op << 27) | (keep_cs ? 4u : 0u));
++	dl = gt_deadline(500 * NSEC_PER_MSEC);
++	for (;;) {
++		uint32_t irq = gt_rd(gt.se, SE_IRQ);
++		if (irq & IRQ_ERR) {
++			gt_wr(gt.se, SE_IRQ_CLR, irq);
++			return EIO;
++		}
++		if (op == 1) {
++			while (sent < n && (gt_rd(gt.se, SE_TXSTAT) & 0xfffffffu) < 16) {
++				uint32_t w = 0;
++				for (unsigned j = 0; j < 4 && sent + j < n; j++) {
++					unsigned i = sent + j;
++					uint8_t v = i < na ? a[i] : b[i - na];
++					w |= (uint32_t)v << (8 * j);
++				}
++				gt_wr(gt.se, SE_TXFIFO, w);
++				sent += 4;
++			}
++		} else {
++			uint32_t st = gt_rd(gt.se, SE_RXSTAT);
++			unsigned words = st & 0x1ffffffu;
++			while (words--) {
++				uint32_t w = gt_rd(gt.se, SE_RXFIFO);
++				unsigned valid = 4;
++				if ((st & (1u << 31)) && !words) {
++					unsigned v = (st >> 28) & 7;
++					if (v && v < 4) {
++						valid = v;
++					}
++				}
++				for (unsigned j = 0; j < valid && got < n; j++) {
++					rx[got++] = (uint8_t)(w >> (8 * j));
++				}
++			}
++		}
++		if (irq & IRQ_DONE) {
++			gt_wr(gt.se, SE_IRQ_CLR, irq);
++			if (op == 2) {
++				uint32_t st = gt_rd(gt.se, SE_RXSTAT);
++				unsigned words = st & 0x1ffffffu;
++				while (words--) {
++					uint32_t w = gt_rd(gt.se, SE_RXFIFO);
++					unsigned valid = 4;
++					if ((st & (1u << 31)) && !words) {
++						unsigned v = (st >> 28) & 7;
++						if (v && v < 4) {
++							valid = v;
++						}
++					}
++					for (unsigned j = 0; j < valid && got < n; j++) {
++						rx[got++] = (uint8_t)(w >> (8 * j));
++					}
++				}
++				return got == n ? 0 : EIO;
++			}
++			return sent >= n ? 0 : EIO;
++		}
++		if (mach_absolute_time() > dl) {
++			gt_wr(gt.se, 0x604, 4);         /* cancel */
++			return ETIMEDOUT;
++		}
++	}
++}
++
++/* Read n bytes at NT36xxx address a. The IC returns one dummy byte first: rx[0] is junk. */
++static int
++nvt_read(uint32_t a, uint8_t *rx, unsigned n)
++{
++	uint8_t h[3] = { 0xff, (uint8_t)(a >> 15), (uint8_t)(a >> 7) }, r = (uint8_t)(a & 0x7f);
++	int e = gt_spi(1, h, 3, NULL, 0, NULL, 0, false);
++	if (e) {
++		return e;
++	}
++	e = gt_spi(1, &r, 1, NULL, 0, NULL, 0, true);
++	if (e) {
++		return e;
++	}
++	return gt_spi(2, NULL, 0, NULL, 0, rx, n, false);
++}
++
++static int
++nvt_write(uint32_t a, const uint8_t *data, unsigned n)
++{
++	uint8_t h[3] = { 0xff, (uint8_t)(a >> 15), (uint8_t)(a >> 7) };
++	uint8_t r = (uint8_t)((a & 0x7f) | 0x80);
++	int e = gt_spi(1, h, 3, NULL, 0, NULL, 0, false);
++	return e ? e : gt_spi(1, &r, 1, data, n, NULL, 0, false);
++}
++
++static int
++nvt_write1(uint32_t a, uint8_t v)
++{
++	return nvt_write(a, &v, 1);
++}
++
++static uint8_t
++nvt_rd1(uint32_t a)
++{
++	uint8_t t[2] = { 0, 0 };
++	(void)nvt_read(a, t, 2);
++	return t[1];
++}
++
++static uint32_t
++gt_le32(const unsigned char *p)
++{
++	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static bool
++gt_clocks(void)
++{
++	uint64_t dl = gt_deadline(50 * NSEC_PER_MSEC);
++
++	gt_wr(gt.gcc, GT_GCC_VOTE, gt_rd(gt.gcc, GT_GCC_VOTE) | 0x13c0u);
++	gt_wr(gt.gcc, GT_GCC_RCG + 4u, 1u);                      /* XO, div 1: 19.2 MHz */
++	gt_wr(gt.gcc, GT_GCC_RCG, gt_rd(gt.gcc, GT_GCC_RCG) | 1u);       /* UPDATE */
++	while (gt_rd(gt.gcc, GT_GCC_RCG) & 1u) {
++		if (mach_absolute_time() > dl) {
++			return false;
++		}
++	}
++	dl = gt_deadline(50 * NSEC_PER_MSEC);
++	while (gt_rd(gt.gcc, GT_GCC_RCG - 4u) & (1u << 31)) {   /* CLK_OFF */
++		if (mach_absolute_time() > dl) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++gt_se_init(void)
++{
++	gt_wr(gt.se, 0xe18, 0);
++	gt_wr(gt.se, 0xe1c, 0);
++	gt_wr(gt.se, 0x644, 0);
++	gt_wr(gt.se, 0x648, 0xffffffffu);
++	gt_wr(gt.se, SE_DMA_MODE, 0);
++	gt_wr(gt.se, SE_CGC, gt_rd(gt.se, SE_CGC) | 0x7fu);
++	gt_wr(gt.se, 0xe30, gt_rd(gt.se, 0xe30) | 0xfu);
++	gt_wr(gt.se, SE_OUTCTRL, 0x7f);
++	gt_wr(gt.se, SE_FORCEDEF, 1);
++	gt_wr(gt.se, SE_CPHA, 0);
++	gt_wr(gt.se, SE_CPOL, 0);
++	gt_wr(gt.se, SE_DEMUX_SEL, 0);
++	gt_wr(gt.se, SE_DEMUX_INV, 0);
++	gt_wr(gt.se, 0x22c, 0);
++	gt_wr(gt.se, 0x25c, gt_rd(gt.se, 0x25c) & ~2u);
++	gt_wr(gt.se, 0x254, 0);
++	gt_wr(gt.se, 0x260, 0x0007f8feu);
++	gt_wr(gt.se, 0x264, 0x000ffefeu);
++	gt_wr(gt.se, 0x284, 0x0007f8feu);
++	gt_wr(gt.se, 0x288, 0x000ffefeu);
++	gt_wr(gt.se, SE_WORD_LEN, 4);                           /* 8 bits per word */
++	gt_wr(gt.se, SE_CLK_SEL, 0);
++	gt_wr(gt.se, SE_CLK_CFG, (4u << 4) | 1u);               /* 19.2 MHz / 4 = 4.8 MHz */
++	gt_wr(gt.se, SE_TXWM, 0);
++	gt_wr(gt.se, SE_RXWM, 0);
++	gt_wr(gt.se, SE_RXRFR, 15);
++	gt_wr(gt.se, SE_IRQ_EN, IRQ_DONE | IRQ_ERR | (1u << 4) | (1u << 5) | (1u << 26) | (1u << 27) | (1u << 30));
++	gt_wr(gt.se, SE_IRQ_CLR, 0xffffffffu);
++}
++
++/* Download the firmware into the IC's SRAM, as shim/touch.c nvt_download_fw() does. */
++static int
++gt_download_fw(const unsigned char *d, unsigned len)
++{
++	uint32_t end = gt_le32(d), pos = 0x30, info = 0;
++	unsigned ovly = (d[0x28] & 0x10) ? (d[0x28] & 0x0f) : 0;
++	struct { uint32_t bin, sram, size, crc; } t[40];
++	unsigned np = 0;
++	int e;
++
++	if (len < 0x100) {
++		return EINVAL;
++	}
++	while (pos < end) {
++		info++;
++		pos += 0x10;
++	}
++	if (2 + info + ovly > 40) {
++		return EINVAL;
++	}
++	for (unsigned l = 0; l < 2; l++) {
++		t[np].bin = gt_le32(d + l * 12);
++		t[np].sram = gt_le32(d + 4 + l * 12);
++		t[np].size = gt_le32(d + 8 + l * 12);
++		t[np].crc = gt_le32(d + 0x18 + l * 4);
++		np++;
++	}
++	for (unsigned i = 0; i < info; i++) {
++		unsigned o = 0x30 + 0x10 * i;
++		t[np].sram = gt_le32(d + o);
++		t[np].size = gt_le32(d + o + 4);
++		t[np].bin = gt_le32(d + o + 8);
++		t[np].crc = gt_le32(d + o + 12);
++		np++;
++	}
++	for (unsigned i = 0; i < ovly; i++) {
++		unsigned o = t[1].bin + 0x10 * i;
++		if (o + 16 > len) {
++			return EINVAL;
++		}
++		t[np].sram = gt_le32(d + o);
++		t[np].size = gt_le32(d + o + 4);
++		t[np].bin = gt_le32(d + o + 8);
++		t[np].crc = gt_le32(d + o + 12);
++		np++;
++	}
++	for (unsigned l = 0; l < np; l++) {
++		if (t[l].size && (uint64_t)t[l].bin + t[l].size + 1 > len) {
++			return EINVAL;
++		}
++	}
++	(void)nvt_write1(0x7fff80, 0x5a);               /* engine reset into idle */
++	gt_sleep_ms(45);
++	(void)nvt_write1(0x3f0fe, 0x69);                /* bootloader reset */
++	gt_sleep_ms(35);
++	(void)nvt_write1(0x3f310, 0);
++	for (unsigned l = 0; l < np; l++) {
++		unsigned size = t[l].size;
++		if (!size) {
++			continue;
++		}
++		size += 1;                              /* the vendor driver writes size + 1 */
++		for (unsigned j = 0; j < size; j += 2048) {
++			unsigned n = size - j < 2048 ? size - j : 2048;
++			e = nvt_write(t[l].sram + j, d + t[l].bin + j, n);
++			if (e) {
++				return e;
++			}
++		}
++	}
++	static const uint32_t des[2] = { 0x3f128, 0x3f12c }, lenreg[2] = { 0x3f118, 0x3f130 },
++	    crcreg[2] = { 0x3f100, 0x3f104 };
++	for (unsigned l = 0; l < 2; l++) {
++		uint8_t v[4];
++		v[0] = (uint8_t)t[l].sram; v[1] = (uint8_t)(t[l].sram >> 8); v[2] = (uint8_t)(t[l].sram >> 16);
++		if ((e = nvt_write(des[l], v, 3))) {
++			return e;
++		}
++		v[0] = (uint8_t)t[l].size; v[1] = (uint8_t)(t[l].size >> 8); v[2] = (uint8_t)(t[l].size >> 16);
++		if ((e = nvt_write(lenreg[l], v, 3))) {
++			return e;
++		}
++		v[0] = (uint8_t)t[l].crc; v[1] = (uint8_t)(t[l].crc >> 8);
++		v[2] = (uint8_t)(t[l].crc >> 16); v[3] = (uint8_t)(t[l].crc >> 24);
++		if ((e = nvt_write(crcreg[l], v, 4))) {
++			return e;
++		}
++	}
++	uint8_t bld = nvt_rd1(0x3f30e);                 /* BLD_CRC_EN: set bit 7 only */
++	(void)nvt_write1(0x3f30e, (uint8_t)(bld | 0x80));
++	(void)nvt_write1(GT_EVT | 0x60, 0);             /* clear reset-complete */
++	(void)nvt_write1(GT_EVT | 0x50, 0xae);          /* host command */
++	(void)nvt_write1(0x3f10d, 1);                   /* boot ready */
++	gt_sleep_ms(10);
++	return 0;
++}
++
++static void
++gt_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < 10; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(gt.active & bit) || x[id] != gt.x[id] || y[id] != gt.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			gt.x[id] = x[id];
++			gt.y[id] = y[id];
++		} else if (gt.active & bit) {
++			sweet_hid_touch((int)id, 0, gt.x[id], gt.y[id]);
++		}
++	}
++	gt.active = mask;
++}
++
++/* Parse one 66-byte read (p[0] is the dummy byte). Returns 0 or an errno. */
++static void
++gt_parse(const uint8_t *p)
++{
++	int x[10] = {0}, y[10] = {0};
++	uint32_t mask = 0;
++
++	if (p[1] == 0xfd || p[1] == 0xfe || p[1] == 0x77) {
++		return;                                 /* IC in recovery/reset: keep state */
++	}
++	for (unsigned i = 0; i < 10; i++) {
++		const uint8_t *f = p + 6 * i + 1;
++		unsigned id = f[0] >> 3, st = f[0] & 7;
++		if (id == 0 || id > 10 || (st != 1 && st != 2) || (mask & (1u << (id - 1)))) {
++			continue;
++		}
++		unsigned px = ((unsigned)f[1] << 4) + (f[3] >> 4);
++		unsigned py = ((unsigned)f[2] << 4) + (f[3] & 0xf);
++		if (px > 1079 || py > 2339) {
++			continue;
++		}
++		mask |= 1u << (id - 1);
++		x[id - 1] = (int)px;
++		y[id - 1] = (int)py;
++	}
++	gt_report(mask, x, y);
++}
++
++static void
++gt_thread(void *arg, wait_result_t result)
++{
++	DTEntry node;
++	const unsigned char *fw = NULL;
++	unsigned fwlen = 0;
++	unsigned delay_s = 20;
++
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET NVT: starting in %u s\n", delay_s);
++	gt_sleep_ms(delay_s * 1000u);
++
++	void const *prop = NULL;
++	unsigned int plen = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "touch-firmware", &prop, &plen) == kSuccess && plen >= 0x100) {
++		fw = (const unsigned char *)prop;
++		fwlen = plen;
++	}
++	printf("SWEET NVT: firmware %s (%u bytes)\n", fw ? "found in the device tree" : "MISSING", fwlen);
++
++	gt.gcc = ml_io_map(GT_GCC_PA, 0x80000);
++	gt.west = ml_io_map(GT_TLMM_WEST_PA, 0x5a000);
++	gt.se = ml_io_map(GT_SE2_PA, 0x4000);
++	if (!gt.gcc || !gt.west || !gt.se) {
++		printf("SWEET NVT: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!gt_clocks()) {
++		printf("SWEET NVT: SE2 clock did not come up\n");
++		goto out;
++	}
++	if (((gt_rd(gt.se, 0x68) >> 8) & 0xffu) != 1u) {
++		printf("SWEET NVT: SE2 is not an SPI engine (fw %#x)\n", gt_rd(gt.se, 0x68));
++		goto out;
++	}
++	for (unsigned p = 6; p <= 9; p++) {
++		gt_pin_cfg(p, 1, 0, 2, 0);              /* qup02 SPI, 6 mA, no pull */
++	}
++	gt_pin_cfg(GT_PIN_IRQ, 0, 0, 3, 0);
++	gt_se_init();
++	gt_pin_out(GT_PIN_RESET, 0);
++	gt_sleep_ms(20);
++	gt_pin_out(GT_PIN_RESET, 1);
++	gt_sleep_ms(150);
++
++	uint8_t id[8] = { 0 };
++	bool ok = false;
++	for (int i = 0; i < 5 && !ok; i++) {
++		(void)nvt_write1(0x3f0fe, 0x69);
++		gt_sleep_ms(35);
++		(void)nvt_write1(0x3f310, 0);
++		gt_sleep_ms(10);
++		ok = nvt_read(0x1f64e, id, 7) == 0 && id[1] == 0x0a && id[4] == 0x72 && id[5] == 0x66 && id[6] == 0x03;
++	}
++	printf("SWEET NVT: chip id %02x %02x %02x %02x %02x %02x -> %s\n", id[1], id[2], id[3], id[4], id[5], id[6],
++	    ok ? "NT36672A" : "unexpected");
++	if (!ok || !fw) {
++		goto out;
++	}
++	int e = gt_download_fw(fw, fwlen);
++	uint8_t rs[6] = { 0 };
++	int tries = 0;
++	for (; tries < 50; tries++) {
++		if (nvt_read(GT_EVT | 0x60, rs, 6) == 0 && rs[1] >= 0xa0 && rs[1] <= 0xaf) {
++			break;
++		}
++		gt_sleep_ms(10);
++	}
++	printf("SWEET NVT: firmware download err=%d, state %#x after %d tries\n", e, rs[1], tries);
++	if (e || tries >= 50) {
++		goto out;
++	}
++	printf("SWEET NVT: touch running (event buffer %#x, polling)\n", GT_EVT);
++	unsigned errs = 0;
++	for (;;) {
++		uint8_t p[67];
++		if (nvt_read(GT_EVT, p, 66) == 0) {
++			errs = 0;
++			gt_parse(p);
++		} else if (++errs == 20) {
++			gt_report(0, gt.x, gt.y);
++			printf("SWEET NVT: persistent SPI errors, backing off\n");
++		}
++		gt_sleep_ms(errs >= 20 ? 500 : 8);
++	}
++
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++ginkgo_touch_init(void)
++{
++	thread_t thread;
++
++	if (gt.started) {
++		return;
++	}
++	gt.started = true;
++	if (kernel_thread_start(gt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET NVT: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 370d18b..709ecd3 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -757,6 +757,12 @@ sweet_touch_init(void)
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+ 	}
++	if (enabled == 2) {
++		/* ginkgo: Novatek NT36672A over SPI (bsd/dev/ginkgo_touch.c) */
++		extern void ginkgo_touch_init(void);
++		ginkgo_touch_init();
++		return;
++	}
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index d2f4fa1..ad2e676 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -435,9 +435,9 @@ SweetHIDTouch::start(IOService *provider)
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
++	fLogicalH = native ? 2340 : 2436;
+ 	fOffX = ((fLogicalW - 1080) / 2) & ~3;           /* as SweetFramebuffer.cpp */
+-	fOffY = (fLogicalH - 2400) / 2;
++	fOffY = (fLogicalH - 2340) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -459,7 +459,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	y = y < 0 ? 0 : (y > 2339 ? 2339 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -473,7 +473,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	}
+ 	if (!was && down) {
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		    y < SWEET_TOUCH_EDGE_PX || y > 2339 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);

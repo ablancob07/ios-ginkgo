@@ -44,6 +44,12 @@ QEMU_VTIMER_INTID = 27
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'ginkgo boot manifest').digest()
 
+# ginkgo: the NT36672A touch IC has no firmware of its own; the kernel downloads it from
+# /chosen "touch-firmware". Proprietary (Novatek/Xiaomi): taken from the phone's own
+# /vendor/firmware/novatek_ts_tianma_fw.bin at build time, never committed.
+_tsfw = os.environ.get('GINKGO_TSFW', '')
+TSFW_PROPS = [('touch-firmware', open(_tsfw, 'rb').read())] if _tsfw and os.path.exists(_tsfw) else []
+
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
 # the root identity and /product of the real D22AP device tree. That tree is
@@ -86,7 +92,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
-    chosen = node('chosen', [
+    chosen = node('chosen', TSFW_PROPS + [
         ph(),
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),

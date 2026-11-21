@@ -15,16 +15,35 @@ cd "$(dirname "$0")"
 CC="clang --target=aarch64-none-elf"
 LD=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="${EXTRA_CFLAGS:-} -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-jump-tables -Wall -Wextra -Wno-unused-command-line-argument"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-jump-tables -Wall -Wextra -Wno-unused-command-line-argument"
 DTBDIR=${DTBDIR:-../../../dtb/stock}
 MKBOOTIMG=${MKBOOTIMG:-python3 /home/usuario/ios-port-ginkgo/dl/mkbootimg/src/mkbootimg.py}
 SRCS="start.S shim.c console.c mmu.c fdt.c loader.c emmc.c touch.c"
 mkdir -p out
+TSFW=${TSFW:-/home/usuario/ios-port-ginkgo/dl/tsfw/novatek_ts_tianma_fw.bin}
+if [ -f "$TSFW" ]; then
+	python3 -I - "$TSFW" out/tsfw.c <<'PYEOF'
+import sys
+d=open(sys.argv[1],'rb').read()
+with open(sys.argv[2],'w') as f:
+    f.write('const unsigned nvt_fw_len = %d;\nconst unsigned char nvt_fw[%d] = {\n' % (len(d), len(d)))
+    for i in range(0,len(d),16):
+        f.write(','.join(str(x) for x in d[i:i+16])+',\n')
+    f.write('};\n')
+PYEOF
+	EXTRA_CFLAGS="${EXTRA_CFLAGS:-} -DHAVE_TSFW"
+	SRCS_EXTRA="out/tsfw.c"
+fi
+CFLAGS="$CFLAGS ${EXTRA_CFLAGS:-}"
 OBJS=""
 for f in $SRCS; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 	OBJS="$OBJS out/${f%.*}.o"
 done
+if [ -n "${SRCS_EXTRA:-}" ]; then
+	$CC $CFLAGS -c $SRCS_EXTRA -o out/tsfw.o
+	OBJS="$OBJS out/tsfw.o"
+fi
 abs=$(aarch64-linux-gnu-readelf -r $(echo $OBJS | sed 's#out/start.o##') | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $LD -O2 -ffreestanding -nostdlib -static -T shim.ld -Wl,--build-id=none -Wl,-N $OBJS -o out/shim.elf
