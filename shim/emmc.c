@@ -27,7 +27,9 @@
 #define R_DATA		0x20
 #define R_PRESENT	0x24
 #define R_HOSTCTL	0x28		/* u8 */
+#define R_PWR		0x29		/* u8 */
 #define R_CLK		0x2c		/* u16 */
+#define R_TOUT		0x2e		/* u8 */
 #define R_SWRST		0x2f		/* u8 */
 #define R_INT		0x30
 #define R_INTEN		0x34
@@ -47,6 +49,7 @@
 static inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(SDHCI_BASE + off); }
 static inline uint16_t rd16(uint32_t off) { return *(volatile uint16_t *)(SDHCI_BASE + off); }
 static inline uint8_t rd8(uint32_t off) { return *(volatile uint8_t *)(SDHCI_BASE + off); }
+static inline void wr8(uint32_t off, uint8_t v) { *(volatile uint8_t *)(SDHCI_BASE + off) = v; }
 static inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(SDHCI_BASE + off) = v; }
 static inline void wr16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(SDHCI_BASE + off) = v; }
 
@@ -64,7 +67,17 @@ static int timed_out(uint64_t t0, unsigned ms)
 }
 
 static uint8_t buf[512 * 8] __attribute__((aligned(16)));
-static uint32_t rca;	/* card address, learnt by probing */
+
+/* Reset the CMD and DAT lines (not the whole host: keep Qualcomm vendor state). */
+static void reset_lines(void)
+{
+	uint64_t t0 = ticks();
+
+	wr8(R_SWRST, 0x06);
+	while (rd8(R_SWRST) & 0x06)
+		if (timed_out(t0, 100))
+			break;
+}
 
 /*
  * Issue one command and wait for completion. data != 0: single-block read of
@@ -93,15 +106,19 @@ static uint32_t sd_cmd(uint32_t idx, uint32_t arg, uint32_t flags, int data, uin
 		uint32_t s = rd32(R_INT);
 		if (s & INT_ERR) {
 			wr32(R_INT, s);
+			reset_lines();
 			return s ? s : 0x20000000;
 		}
 		if (s & INT_CMD_DONE)
 			break;
-		if (timed_out(t0, 200))
+		if (timed_out(t0, 200)) {
+			reset_lines();
 			return 0x30000000;
+		}
 	}
 	if (resp)
-		*resp = rd32(R_RESP0);
+		for (int i = 0; i < 4; i++)
+			resp[i] = rd32(R_RESP0 + 4 * i);
 	wr32(R_INT, INT_CMD_DONE);
 	if (!data)
 		return 0;
@@ -111,12 +128,15 @@ static uint32_t sd_cmd(uint32_t idx, uint32_t arg, uint32_t flags, int data, uin
 		uint32_t s = rd32(R_INT);
 		if (s & INT_ERR) {
 			wr32(R_INT, s);
+			reset_lines();
 			return s;
 		}
 		if (s & INT_BUF_RD)
 			break;
-		if (timed_out(t0, 500))
+		if (timed_out(t0, 500)) {
+			reset_lines();
 			return 0x40000000;
+		}
 	}
 	wr32(R_INT, INT_BUF_RD);
 	for (int i = 0; i < 128; i++) {
@@ -137,6 +157,10 @@ static uint32_t sd_cmd(uint32_t idx, uint32_t arg, uint32_t flags, int data, uin
 
 /* R1 response, 48 bits with CRC and index check */
 #define F_R1	((2) | (1 << 3) | (1 << 4))
+#define F_R1B	((3) | (1 << 3) | (1 << 4))
+#define F_R2	((1) | (1 << 3))
+#define F_R3	(2)
+#define F_NONE	(0)
 
 static uint32_t read_lba(uint32_t lba)
 {
@@ -171,33 +195,84 @@ static int want(const char *n)
 	return 0;
 }
 
+static void delay_us(unsigned us)
+{
+	uint64_t t0 = ticks();
+
+	while (ticks() - t0 < (uint64_t)us * 19)
+		;
+}
+
+/* SD clock = base / (2 * n); caps say base 200 MHz -> n = 250 gives ~400 kHz */
+static int set_clock(unsigned n)
+{
+	uint64_t t0 = ticks();
+
+	wr16(R_CLK, 0);
+	wr16(R_CLK, (uint16_t)(((n & 0xff) << 8) | ((n >> 8) & 3) << 6 | 1));
+	while (!(rd16(R_CLK) & 2))
+		if (timed_out(t0, 150))
+			return -1;
+	wr16(R_CLK, rd16(R_CLK) | 4);	/* SD clock enable */
+	delay_us(2000);
+	return 0;
+}
+
 void test_emmc(void)
 {
 	char nm[24];
-	uint32_t st, r1 = 0;
+	uint32_t st, rr[4] = { 0 };
 
-	con_str("EMMC", "ginkgo sdhci@4744000 probe (read only)");
-	con_skip();
-	/* Reading these registers is the first thing that can hang if the clock is gated. */
-	con_str("EMMC", "reading HC regs...");
+	con_clear(RED);
+	con_str("EMMC", "ginkgo sdhci@4744000 (read only)");
 	con_hex2("EMMC VER", "ver=", rd16(R_VER), "caps=", rd32(R_CAPS));
 	con_hex2("EMMC PRES", "present=", rd32(R_PRESENT), "hostctl=", rd8(R_HOSTCTL));
-	con_hex2("EMMC CLK", "clk=", rd16(R_CLK), "ctrl2=", rd16(R_CTRL2));
+	con_hex2("EMMC CLK", "clk=", rd16(R_CLK), "pwr=", rd8(R_PWR));
 	con_hex2("EMMC INT", "int=", rd32(R_INT), "inten=", rd32(R_INTEN));
 	con_skip();
 
-	/* Find the RCA ABL assigned: CMD13 answers with the card state only for the right one. */
-	con_str("EMMC", "CMD13 scan for RCA...");
-	rca = 0;
-	for (uint32_t a = 1; a <= 8; a++) {
-		st = sd_cmd(13, a << 16, F_R1, 0, &r1);
-		con_hex2("CMD13", "rca=", a, "err/r1=", st ? st : r1);
-		if (!st && ((r1 >> 9) & 0xf) == 4) {	/* current state: tran */
-			rca = a;
+	/* ABL left the status enables off and the SD clock gated: bring the host up ourselves. */
+	wr32(R_INTEN, 0x01ff01ff);
+	wr32(R_INT, 0xffffffff);
+	reset_lines();
+	wr8(R_TOUT, 0x0e);
+	if (!(rd8(R_PWR) & 1))
+		wr8(R_PWR, 0x0b);	/* bus power on, 1.8 V (eMMC VCCQ); regulators are external */
+	int cr = set_clock(250);
+	con_hex2("EMMC UP", "clkrc=", cr, "clk=", rd16(R_CLK));
+	con_hex2("EMMC UP", "pwr=", rd8(R_PWR), "pres=", rd32(R_PRESENT));
+	con_skip();
+
+	/* Standard eMMC identification, 1-bit legacy timing. No CMD6, nothing persistent. */
+	st = sd_cmd(0, 0, F_NONE, 0, 0);
+	con_hex("CMD0", st);
+	delay_us(2000);
+	int ready = 0;
+	for (int i = 0; i < 1000 && !st; i++) {
+		st = sd_cmd(1, 0x40ff8080u, F_R3, 0, rr);
+		if (st || (rr[0] & 0x80000000u)) {
+			ready = !st;
 			break;
 		}
+		delay_us(1000);
 	}
-	con_hex("EMMC RCA", rca);
+	con_hex2("CMD1", "err=", st, "ocr=", rr[0]);
+	if (!ready)
+		return;
+	st = sd_cmd(2, 0, F_R2, 0, rr);
+	con_hex2("CMD2", "err=", st, "cid3=", rr[3]);
+	if (st)
+		return;
+	st = sd_cmd(3, 1u << 16, F_R1, 0, rr);
+	con_hex2("CMD3", "err=", st, "r1=", rr[0]);
+	if (st)
+		return;
+	st = sd_cmd(7, 1u << 16, F_R1B, 0, rr);
+	con_hex2("CMD7", "err=", st, "r1=", rr[0]);
+	if (st)
+		return;
+	st = sd_cmd(13, 1u << 16, F_R1, 0, rr);
+	con_hex2("CMD13", "err=", st, "r1=", rr[0]);
 	con_skip();
 
 	con_str("EMMC", "CMD17 read LBA 1 (GPT header)");
