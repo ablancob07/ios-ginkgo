@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -5233,7 +5233,9 @@
+ 	LOG("t=%u ms: join: %.*s %02x:%02x:%02x:**:**:** %u MHz %s", g_ms, (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
+ 	    s_bssid[2], s_freq, s_rsn ? "WPA2" : "open");
+ 	w_ps_off();
++	LOG("t=%u ms: join: vdev start %u MHz mode %u bcn %u dtim %u", g_ms, s_freq, s_freq < 4000 ? 1u : 0u, bcn, dtim);
+ 	if (!w_vdev_start(s_freq, bcn, dtim)) {
++		LOG("t=%u ms: join: vdev start command not sent", g_ms);
+ 		w_join_end(EIO);
+ 		return;
+ 	}
+@@ -5309,6 +5311,9 @@
+ 	if (id == 0x5001 && l >= 16) {             /* VDEV_START_RESP {vdev, req, type, status} */
+ 		s_start_status = (int32_t)v[3];
+ 		s_start_resp = true;
++		/* ginkgo: 1 invalid vdev, 2 not supported, 3 DFS violation, 4 invalid regdomain */
++		LOG("t=%u ms: join: VDEV_START_RESP vdev %u req %u type %u status %d (tlv len %u)", g_ms, v[0], v[1], v[2],
++		    (int32_t)v[3], (unsigned)l);
+ 	} else if (id == 0x6001 && s_state == S_UP) {   /* PEER_STA_KICKOUT */
+ 		LOG("t=%u ms: join: peer kickout", g_ms);
+ 		w_teardown();
+@@ -5585,9 +5590,16 @@
+ 	case 0x6001:                                /* PEER_STA_KICKOUT */
+ 		w_join_event(id, d + 4, len - 4);
+ 		break;
+-	default:
++	default: {
++		/* ginkgo: show what else the firmware says while a join is in progress */
++		static unsigned n_other;
++		if (s_state != S_IDLE && s_state != S_UP && n_other < 40) {
++			n_other++;
++			LOG("t=%u ms: join: wmi event %#x len %u (state %u)", g_ms, id, (unsigned)len, (unsigned)s_state);
++		}
+ 		break;
+ 	}
++	}
+ }
+ 
+ /* from the watch loop */
