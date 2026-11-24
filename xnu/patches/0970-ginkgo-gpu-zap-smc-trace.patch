@@ -1,0 +1,32 @@
+ginkgo GPU: trace every zap SMC (shutdown, init_image, mem_setup, auth_and_reset) to find where the TrustZone call hangs
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -626,12 +626,17 @@
+ 		memcpy(meta.va, mdt, mdt_size);
+ 		sweet_dcache_clean((vm_offset_t)meta.va, (unsigned)mdt_size);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+-		scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
++		IOLog("TopazGPU: zap: smc shutdown...\n");
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
++		IOLog("TopazGPU: zap: shutdown -> %llx/%llx\n", st, res);
++		IOLog("TopazGPU: zap: smc init_image(meta %#llx)...\n", meta.pa);
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta.pa, 0, &res);
++		IOLog("TopazGPU: zap: init_image -> %llx/%llx\n", st, res);
+ 		if (st != 0 || res != 0) {
+ 			IOLog("TopazGPU: zap init_image: %llx/%llx\n", st, res);
+ 			goto out;
+ 		}
++		IOLog("TopazGPU: zap: smc mem_setup(%#llx, %#llx)...\n", (uint64_t)ZAP_REGION, (uint64_t)(max_a - min_a));
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, GPU_PAS_ID, ZAP_REGION, max_a - min_a, &res);
+ 		if (st != 0 || res != 0) {
+ 			IOLog("TopazGPU: zap mem_setup: %llx/%llx\n", st, res);
+@@ -650,6 +655,7 @@
+ 			dst[at + i] = ((const uint8_t *)seg)[i];
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
++		IOLog("TopazGPU: zap: smc auth_and_reset...\n");
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, GPU_PAS_ID, 0, 0, &res);
+ 		IOLog("TopazGPU: zap auth_and_reset: %llx/%llx\n", st, res);
+ 		ok = st == 0 && res == 0;
